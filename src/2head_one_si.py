@@ -1,3 +1,5 @@
+# reference codes: https://github.com/malbergo/stochastic-interpolants
+
 import argparse
 import math
 import os

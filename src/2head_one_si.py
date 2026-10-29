@@ -51,17 +51,11 @@ def make_It(path="one-sided-linear", gamma=None, gamma_dot=None, gg_dot=None):
 
 
 class Interpolant(torch.nn.Module):
-    def __init__(
-        self, path: str = "one-sided-linear", gamma_type: str = "zero"
-    ):
+    def __init__(self, path: str = "one-sided-linear", gamma_type: str = "zero"):
         super().__init__()
         self.path = path
-        self.gamma, self.gamma_dot, self.gg_dot = make_gamma(
-            gamma_type=gamma_type
-        )
-        self.It, self.dtIt, ab = make_It(
-            path, self.gamma, self.gamma_dot, self.gg_dot
-        )
+        self.gamma, self.gamma_dot, self.gg_dot = make_gamma(gamma_type=gamma_type)
+        self.It, self.dtIt, ab = make_It(path, self.gamma, self.gamma_dot, self.gg_dot)
         self.a, self.adot, self.b, self.bdot = ab
 
     def calc_xt(self, t: torch.Tensor, x0: torch.Tensor, x1: torch.Tensor):
@@ -114,10 +108,7 @@ class SimpleNormal:
 
 def target(bs: int, device: str):
     x1 = torch.rand(bs, device=device) * 4 - 2
-    x2_ = (
-        torch.rand(bs, device=device)
-        - torch.randint(2, (bs,), device=device) * 2
-    )
+    x2_ = torch.rand(bs, device=device) - torch.randint(2, (bs,), device=device) * 2
     x2 = x2_ + (torch.floor(x1) % 2)
     return torch.cat([x1[:, None], x2[:, None]], dim=1) * 2
 
@@ -163,9 +154,7 @@ def sample_ode(model, x0, steps=100):
     model.eval()
     t_span = torch.linspace(0.0, 1.0, steps, device=x0.device)
     ode_func = ODEWrapper(model)
-    trajectory = odeint(
-        ode_func, x0, t_span, method="dopri5", atol=1e-5, rtol=1e-5
-    )
+    trajectory = odeint(ode_func, x0, t_span, method="dopri5", atol=1e-5, rtol=1e-5)
     return trajectory[-1]
 
 
@@ -177,9 +166,7 @@ def sample_sde(model, x0, steps=100, eps=0.1):
 
     for i in range(steps):
         t_val = i * dt
-        t_vec = torch.full(
-            (x.shape[0], 1), t_val, device=x.device, dtype=x.dtype
-        )
+        t_vec = torch.full((x.shape[0], 1), t_val, device=x.device, dtype=x.dtype)
 
         b_pred, eta_pred = model(x, t_vec)
         drift = b_pred + eps * eta_pred
@@ -207,9 +194,7 @@ def parse_args():
     parser.add_argument(
         "--batch_size", type=int, default=512, help="Batch size for training"
     )
-    parser.add_argument(
-        "--lr", type=float, default=1e-3, help="Learning rate"
-    )
+    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
     parser.add_argument(
         "--hidden_dim",
         type=int,
@@ -222,9 +207,7 @@ def parse_args():
         default=0.9,
         help="Velocity loss weighting multiplier",
     )
-    parser.add_argument(
-        "--log_freq", type=int, default=200, help="Logging frequency"
-    )
+    parser.add_argument("--log_freq", type=int, default=200, help="Logging frequency")
     parser.add_argument(
         "--comet_project_name",
         type=str,
@@ -260,12 +243,8 @@ def main():
     base = SimpleNormal(ndim, device=device)
 
     # Initialize Model, Optimizer, Loss Weight, and Interpolant
-    interpolant = Interpolant(
-        path="one-sided-linear", gamma_type="zero"
-    ).to(device)
-    model = DualHeadVelocityScoreMLP(dim=ndim, hidden_dim=args.hidden_dim).to(
-        device
-    )
+    interpolant = Interpolant(path="one-sided-linear", gamma_type="zero").to(device)
+    model = DualHeadVelocityScoreMLP(dim=ndim, hidden_dim=args.hidden_dim).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
     data_dict = {"losses": [], "b_losses": [], "eta_losses": []}
@@ -318,9 +297,7 @@ def main():
     fig_loss, ax_loss = plt.subplots(figsize=(8, 4))
     ax_loss.plot(data_dict["losses"], label="Total Loss (b + eta)", alpha=0.7)
     ax_loss.plot(data_dict["b_losses"], label="Velocity Loss (b)", alpha=0.8)
-    ax_loss.plot(
-        data_dict["eta_losses"], label="Score/Eta Loss (eta)", alpha=0.8
-    )
+    ax_loss.plot(data_dict["eta_losses"], label="Score/Eta Loss (eta)", alpha=0.8)
     ax_loss.set_xlabel("Iteration")
     ax_loss.set_ylabel("Loss Value")
     ax_loss.set_title("Training Loss Curves")
@@ -329,9 +306,7 @@ def main():
     plt.tight_layout()
 
     # Log figure to CometML
-    experiment.log_figure(
-        figure_name="training_loss_curves", figure=fig_loss
-    )
+    experiment.log_figure(figure_name="training_loss_curves", figure=fig_loss)
     plt.close(fig_loss)
 
     # 2. Generate and Log Sampling Comparison Images
@@ -348,23 +323,17 @@ def main():
 
     fig_samples, axes = plt.subplots(1, 3, figsize=(15, 5))
 
-    axes[0].scatter(
-        target_pts[:, 0], target_pts[:, 1], s=2, alpha=0.3, color="black"
-    )
+    axes[0].scatter(target_pts[:, 0], target_pts[:, 1], s=2, alpha=0.3, color="black")
     axes[0].set_xlim(-5, 5)
     axes[0].set_ylim(-6.5, 6.5)
     axes[0].set_title("Target Distribution")
 
-    axes[1].scatter(
-        xf_ode[:, 0], xf_ode[:, 1], s=2, alpha=0.3, color="blue"
-    )
+    axes[1].scatter(xf_ode[:, 0], xf_ode[:, 1], s=2, alpha=0.3, color="blue")
     axes[1].set_xlim(-5, 5)
     axes[1].set_ylim(-6.5, 6.5)
     axes[1].set_title("ODE Probability Flow Samples")
 
-    axes[2].scatter(
-        xf_sde[:, 0], xf_sde[:, 1], s=2, alpha=0.3, color="purple"
-    )
+    axes[2].scatter(xf_sde[:, 0], xf_sde[:, 1], s=2, alpha=0.3, color="purple")
     axes[2].set_xlim(-5, 5)
     axes[2].set_ylim(-6.5, 6.5)
     axes[2].set_title("SDE Flow Samples")
@@ -372,9 +341,7 @@ def main():
     plt.tight_layout()
 
     # Log sampling comparison figure to CometML
-    experiment.log_figure(
-        figure_name="sampling_comparison", figure=fig_samples
-    )
+    experiment.log_figure(figure_name="sampling_comparison", figure=fig_samples)
     plt.close(fig_samples)
 
     experiment.end()

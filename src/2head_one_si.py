@@ -194,7 +194,24 @@ def parse_args():
     parser.add_argument(
         "--batch_size", type=int, default=512, help="Batch size for training"
     )
-    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
+    parser.add_argument(
+        "--lr",
+        type=float,
+        default=2e-3,
+        help="Initial (peak) learning rate for the cosine schedule",
+    )
+    parser.add_argument(
+        "--min_lr",
+        type=float,
+        default=1e-5,
+        help="Final learning rate reached at the end of the cosine schedule",
+    )
+    parser.add_argument(
+        "--warmup_steps",
+        type=int,
+        default=100,
+        help="Linear warmup steps from ~0 up to --lr before cosine decay (0 disables)",
+    )
     parser.add_argument(
         "--hidden_dim",
         type=int,
@@ -242,12 +259,27 @@ def main():
     ndim = 2
     base = SimpleNormal(ndim, device=device)
 
-    # Initialize Model, Optimizer, Loss Weight, and Interpolant
+    # Initialize Model, Optimizer, Scheduler, Loss Weight, and Interpolant
     interpolant = Interpolant(path="one-sided-linear", gamma_type="zero").to(device)
     model = DualHeadVelocityScoreMLP(dim=ndim, hidden_dim=args.hidden_dim).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
-    data_dict = {"losses": [], "b_losses": [], "eta_losses": []}
+    # Linear warmup to args.lr, then cosine decay to args.min_lr
+    if not 0 <= args.warmup_steps < args.num_iterations:
+        raise ValueError("--warmup_steps must be in [0, num_iterations).")
+    min_ratio = args.min_lr / args.lr
+    decay_steps = args.num_iterations - args.warmup_steps
+
+    def lr_lambda(i: int) -> float:
+        if i < args.warmup_steps:
+            return (i + 1) / args.warmup_steps
+        progress = min(1.0, (i - args.warmup_steps) / max(1, decay_steps))
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return min_ratio + (1.0 - min_ratio) * cosine
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+    data_dict = {"losses": [], "b_losses": [], "eta_losses": [], "lrs": []}
 
     print("Starting Training Loop...")
     start_time = time.time()
@@ -268,9 +300,14 @@ def main():
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
 
+        # LR used for this step, then advance the schedule
+        current_lr = scheduler.get_last_lr()[0]
+        scheduler.step()
+
         data_dict["losses"].append(loss_total.item())
         data_dict["b_losses"].append(loss_b.item())
         data_dict["eta_losses"].append(loss_eta.item())
+        data_dict["lrs"].append(current_lr)
 
         # Log metrics to CometML
         experiment.log_metrics(
@@ -278,6 +315,7 @@ def main():
                 "loss_total": loss_total.item(),
                 "loss_b": loss_b.item(),
                 "loss_eta": loss_eta.item(),
+                "lr": current_lr,
             },
             step=step,
         )
@@ -285,6 +323,7 @@ def main():
         if step % args.log_freq == 0 or step == 1:
             print(
                 f"Iter [{step}/{args.num_iterations}] | "
+                f"LR: {current_lr:.2e} | "
                 f"Total Loss: {loss_total.item():.4f} | "
                 f"Loss b: {loss_b.item():.4f} | "
                 f"Loss eta: {loss_eta.item():.4f}"

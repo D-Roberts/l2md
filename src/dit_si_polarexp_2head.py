@@ -275,6 +275,127 @@ def target(bs: int, device: str):
 
 
 # ==========================================
+# Muon Optimizer (Polar Express / Newton-Schulz)
+# ==========================================
+
+# Original Muon quintic (Keller Jordan): same coefficients at every step.
+JORDAN_COEFFS = [(3.4445, -4.7750, 2.0315)]
+
+# Polar Express (Amsel et al., 2025, arXiv:2505.16932): a different minimax-
+# optimal quintic at each step; steps beyond the list reuse the last tuple.
+_POLAR_EXPRESS_RAW = [
+    (8.28721201814563, -23.595886519098837, 17.300387312530933),
+    (4.107059111542203, -2.9478499167379106, 0.5448431082926601),
+    (3.9486908534822946, -2.908902115962949, 0.5518191394370137),
+    (3.3184196573706015, -2.488488024314874, 0.51004894012372),
+    (2.300652019954817, -1.6689039845747493, 0.4188073119525673),
+    (1.891301407787398, -1.2679958271945868, 0.37680408948524835),
+    (1.8750014808534479, -1.2500016453999487, 0.3750001645474248),
+    (1.875, -1.25, 0.375),
+]
+# Safety factor: p(x) -> p(x / 1.01) for all but the last polynomial, so
+# round-off that pushes singular values slightly above 1 cannot blow up.
+POLAR_EXPRESS_COEFFS = [
+    (a / 1.01, b / 1.01**3, c / 1.01**5) for a, b, c in _POLAR_EXPRESS_RAW[:-1]
+] + [_POLAR_EXPRESS_RAW[-1]]
+
+
+def orthogonalize(
+    G: torch.Tensor, steps: int = 5, method: str = "polar_express", eps: float = 1e-7
+) -> torch.Tensor:
+    """Approximate the polar factor U V^T of a 2D matrix G = U S V^T."""
+    if method == "polar_express":
+        coeffs, norm_scale = POLAR_EXPRESS_COEFFS, 1.01
+    elif method == "jordan":
+        coeffs, norm_scale = JORDAN_COEFFS, 1.0
+    else:
+        raise ValueError(f"Unknown ns_method: {method}")
+    coeffs = coeffs[:steps] + [coeffs[-1]] * max(0, steps - len(coeffs))
+
+    # bfloat16 is fast on GPU; on CPU float32 is both faster and more accurate
+    X = G.bfloat16() if G.is_cuda else G.float()
+    transpose = G.size(0) > G.size(1)
+    if transpose:  # iterate on the smaller Gram matrix
+        X = X.mT
+    # eps keeps an all-zero gradient (adaLN-Zero gates are 0 at init) at zero
+    X = X / (X.norm() * norm_scale + eps)
+    for a, b, c in coeffs:
+        A = X @ X.mT
+        B = b * A + c * A @ A
+        X = a * X + B @ X
+    if transpose:
+        X = X.mT
+    return X.to(G.dtype)
+
+
+class Muon(torch.optim.Optimizer):
+    """Single-device Muon for 2D hidden weight matrices.
+
+    Nesterov momentum, then orthogonalize the update, then scale it by
+    sqrt(max(1, rows / cols)) as in the original Muon (and torch.optim.Muon's
+    default). With ns_method="jordan" this matches torch.optim.Muon up to
+    numerics; "polar_express" swaps in the Polar Express coefficients.
+    """
+
+    def __init__(
+        self,
+        params,
+        lr: float = 0.02,
+        momentum: float = 0.95,
+        nesterov: bool = True,
+        weight_decay: float = 0.0,
+        ns_steps: int = 5,
+        ns_method: str = "polar_express",
+    ):
+        if ns_method not in ("polar_express", "jordan"):
+            raise ValueError(f"Unknown ns_method: {ns_method}")
+        defaults = dict(
+            lr=lr,
+            momentum=momentum,
+            nesterov=nesterov,
+            weight_decay=weight_decay,
+            ns_steps=ns_steps,
+            ns_method=ns_method,
+        )
+        super().__init__(params, defaults)
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.ndim != 2:
+                    raise ValueError("Muon only supports 2D parameters.")
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            lr, mu, wd = group["lr"], group["momentum"], group["weight_decay"]
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                g = p.grad
+                state = self.state[p]
+                if "momentum_buffer" not in state:
+                    state["momentum_buffer"] = torch.zeros_like(g)
+                buf = state["momentum_buffer"]
+                buf.lerp_(g, 1 - mu)
+                update = g.lerp(buf, mu) if group["nesterov"] else buf
+
+                update = orthogonalize(
+                    update, steps=group["ns_steps"], method=group["ns_method"]
+                )
+                update = update * max(1.0, p.size(0) / p.size(1)) ** 0.5
+
+                if wd != 0:
+                    p.mul_(1 - lr * wd)
+                p.add_(update, alpha=-lr)
+
+        return loss
+
+
+# ==========================================
 # Loss Calculation & Samplers
 # ==========================================
 
@@ -371,6 +492,19 @@ def parse_args():
         "--muon_momentum", type=float, default=0.95, help="Muon momentum"
     )
     parser.add_argument(
+        "--ns_method",
+        type=str,
+        default="polar_express",
+        choices=["polar_express", "jordan"],
+        help="Muon orthogonalization: Polar Express or the original Newton-Schulz",
+    )
+    parser.add_argument(
+        "--ns_steps",
+        type=int,
+        default=5,
+        help="Number of orthogonalization iterations per Muon step",
+    )
+    parser.add_argument(
         "--weight_decay",
         type=float,
         default=0.0,
@@ -459,9 +593,6 @@ def main():
     # Muon for the 2D weight matrices inside the DiT blocks (Q, K, V, attention
     # output projection, MLP); AdamW for embeddings, position embedding, AdaLN
     # projections, output heads and all biases.
-    if not hasattr(torch.optim, "Muon"):
-        raise RuntimeError("torch.optim.Muon requires PyTorch >= 2.9.")
-
     muon_params = [
         m.weight
         for block in model.blocks
@@ -472,11 +603,13 @@ def main():
     adamw_params = [p for p in model.parameters() if id(p) not in muon_ids]
 
     optimizers = [
-        torch.optim.Muon(
+        Muon(
             muon_params,
             lr=args.muon_lr,
             momentum=args.muon_momentum,
             weight_decay=args.weight_decay,
+            ns_steps=args.ns_steps,
+            ns_method=args.ns_method,
         ),
         torch.optim.AdamW(adamw_params, lr=args.lr, weight_decay=args.weight_decay),
     ]

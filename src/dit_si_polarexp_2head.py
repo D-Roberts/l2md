@@ -459,6 +459,300 @@ def sample_sde(model, x0, steps=100, eps=0.1):
 
 
 # ==========================================
+# Gradient Tracking (CometML)
+# ==========================================
+
+
+def grad_group_name(name: str) -> str:
+    """Map a parameter name to a coarse layer group for gradient tracking."""
+    parts = name.split(".")
+    if parts[0] == "blocks":
+        block, sub = parts[1], parts[2]
+        if sub == "attn":
+            # Q and K together: their gradients show whether attention is
+            # actually mixing tokens (they are exactly zero with a single token)
+            label = {
+                "q": "attn_qk",
+                "k": "attn_qk",
+                "v": "attn_v",
+                "proj": "attn_out",
+            }.get(parts[3], f"attn_{parts[3]}")
+        else:
+            label = {"mlp": "mlp", "adaLN_modulation": "adaLN"}.get(sub, sub)
+        return f"block{block}/{label}"
+    return {
+        "x_embedder": "embed/x",
+        "pos_embed": "embed/x",
+        "t_embedder": "embed/t",
+        "final_adaLN": "final/adaLN",
+        "head_b": "heads",
+        "head_eta": "heads",
+    }.get(parts[0], parts[0])
+
+
+class GradientTracker:
+    """Gradient statistics logged to CometML, plus history for end-of-run plots.
+
+    Every step: pre-clip total gradient norm, gradient norm per optimizer
+    group (Muon / AdamW) and whether clipping fired.
+    Every `log_freq` steps: per-layer-group gradient norms and the
+    update-to-weight ratio ||W_new - W_old|| / ||W_old|| per optimizer.
+    Every `hist_freq` steps: gradient histograms per layer group (Comet 3D
+    histograms; large groups are randomly subsampled).
+    """
+
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        opt_groups: dict,
+        experiment,
+        clip_value: float,
+        log_freq: int = 100,
+        hist_freq: int = 500,
+        hist_max_values: int = 100_000,
+    ):
+        self.experiment = experiment
+        self.clip_value = clip_value
+        self.log_freq = log_freq
+        self.hist_freq = hist_freq
+        self.hist_max_values = hist_max_values
+        self.opt_groups = opt_groups
+
+        self.layer_params = {}
+        for name, p in model.named_parameters():
+            if p.requires_grad:
+                self.layer_params.setdefault(grad_group_name(name), []).append(p)
+
+        # History for plots
+        self.steps, self.total_norms, self.clipped = [], [], []
+        self.opt_norms = {k: [] for k in opt_groups}
+        self.detail_steps = []
+        self.layer_norms = {g: [] for g in self.layer_params}
+        self.update_ratios = {k: [] for k in opt_groups}
+        self._snapshot = None
+
+    def _detailed(self, step: int) -> bool:
+        return step == 1 or step % self.log_freq == 0
+
+    def _hist(self, step: int) -> bool:
+        return self.hist_freq > 0 and (step == 1 or step % self.hist_freq == 0)
+
+    @staticmethod
+    def _sq_sum(tensors) -> torch.Tensor:
+        sq = [t.detach().float().pow(2).sum() for t in tensors]
+        return torch.stack(sq).sum() if sq else torch.zeros(())
+
+    def _grad_norm(self, params) -> float:
+        grads = [p.grad for p in params if p.grad is not None]
+        return self._sq_sum(grads).sqrt().item()
+
+    @torch.no_grad()
+    def before_clip(self, step: int):
+        """Call after backward() and before clipping: records raw gradients."""
+        metrics = {}
+        for k, params in self.opt_groups.items():
+            v = self._grad_norm(params)
+            self.opt_norms[k].append(v)
+            metrics[f"grad_norm/{k}"] = v
+
+        if self._detailed(step):
+            self.detail_steps.append(step)
+            for g, params in self.layer_params.items():
+                v = self._grad_norm(params)
+                self.layer_norms[g].append(v)
+                metrics[f"grad_norm_layer/{g}"] = v
+
+        if self._hist(step):
+            for g, params in self.layer_params.items():
+                grads = [p.grad.flatten() for p in params if p.grad is not None]
+                if not grads:
+                    continue
+                vals = torch.cat(grads).float()
+                if vals.numel() > self.hist_max_values:
+                    idx = torch.randint(
+                        vals.numel(), (self.hist_max_values,), device=vals.device
+                    )
+                    vals = vals[idx]
+                self.experiment.log_histogram_3d(
+                    vals.cpu().numpy(), name=f"grad_{g.replace('/', '_')}", step=step
+                )
+
+        self.experiment.log_metrics(metrics, step=step)
+
+    @torch.no_grad()
+    def after_clip(self, step: int, total_norm: float):
+        """Call with the pre-clip total norm returned by clip_grad_norm_."""
+        clipped = total_norm > self.clip_value
+        self.steps.append(step)
+        self.total_norms.append(total_norm)
+        self.clipped.append(clipped)
+        self.experiment.log_metrics(
+            {"grad_norm/total_preclip": total_norm, "grad_clipped": float(clipped)},
+            step=step,
+        )
+        if self._detailed(step):
+            self._snapshot = {
+                k: [p.detach().clone() for p in params]
+                for k, params in self.opt_groups.items()
+            }
+
+    @torch.no_grad()
+    def after_step(self, step: int):
+        """Call after the optimizer steps: update-to-weight ratio per optimizer."""
+        if self._snapshot is None:
+            return
+        metrics = {}
+        for k, params in self.opt_groups.items():
+            old = self._snapshot[k]
+            num = self._sq_sum([p - p0 for p, p0 in zip(params, old)]).sqrt()
+            den = self._sq_sum(old).sqrt()
+            r = (num / (den + 1e-12)).item()
+            self.update_ratios[k].append(r)
+            metrics[f"update_ratio/{k}"] = r
+        self.experiment.log_metrics(metrics, step=step)
+        self._snapshot = None
+
+
+# ==========================================
+# Gradient Visualisation
+# ==========================================
+
+# Chart chrome and categorical slots 1-2 (blue, orange) from a validated palette
+_INK, _INK_2, _MUTED = "#0b0b0b", "#52514e", "#898781"
+_GRID, _AXIS, _SURFACE = "#e1e0d9", "#c3c2b7", "#fcfcfb"
+_SERIES = {"total": "#2a78d6", "muon": "#2a78d6", "adamw": "#eb6834"}
+_SEQ_BLUE = ["#cde2fb", "#9ec5f4", "#6da7ec", "#3987e5", "#256abf", "#184f95", "#0d366b"]
+
+
+def _style_axes(ax):
+    ax.set_facecolor(_SURFACE)
+    ax.grid(True, color=_GRID, linewidth=0.6)
+    ax.set_axisbelow(True)
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+    for side in ("left", "bottom"):
+        ax.spines[side].set_color(_AXIS)
+    ax.tick_params(colors=_INK_2, labelsize=9)
+    ax.xaxis.label.set_color(_INK_2)
+    ax.yaxis.label.set_color(_INK_2)
+    ax.title.set_color(_INK)
+
+
+def _rolling_mean(y, window: int) -> np.ndarray:
+    """Trailing mean with the same length as y (shorter window at the start)."""
+    y = np.asarray(y, dtype=float)
+    if window <= 1 or len(y) == 0:
+        return y
+    c = np.concatenate([[0.0], np.cumsum(y)])
+    idx = np.arange(1, len(y) + 1)
+    start = np.maximum(0, idx - window)
+    return (c[idx] - c[start]) / (idx - start)
+
+
+def _positive(y) -> np.ndarray:
+    """Mask non-positive values (e.g. zero Muon gradients at step 1) for log axes."""
+    y = np.asarray(y, dtype=float)
+    return np.where(y > 0, y, np.nan)
+
+
+def plot_gradient_norms(tracker: GradientTracker):
+    steps = np.asarray(tracker.steps)
+    window = max(1, len(steps) // 50)
+    frac = 100 * float(np.mean(tracker.clipped)) if tracker.clipped else 0.0
+
+    fig, (ax_top, ax_bot) = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
+    fig.patch.set_facecolor(_SURFACE)
+
+    ax_top.plot(steps, _positive(tracker.total_norms), color=_SERIES["total"],
+                alpha=0.25, linewidth=0.8, label="per step")
+    ax_top.plot(steps, _positive(_rolling_mean(tracker.total_norms, window)),
+                color=_SERIES["total"], linewidth=1.6, label=f"rolling mean ({window} steps)")
+    ax_top.axhline(tracker.clip_value, color=_MUTED, linewidth=1.0, linestyle="--")
+    ax_top.annotate(f"clip threshold ({tracker.clip_value:g})",
+                    xy=(1.0, tracker.clip_value), xycoords=("axes fraction", "data"),
+                    xytext=(-4, 4), textcoords="offset points",
+                    ha="right", va="bottom", fontsize=9, color=_INK_2)
+    ax_top.set_yscale("log")
+    ax_top.set_ylabel("gradient norm")
+    ax_top.set_title(f"Total gradient norm before clipping (clipped on {frac:.1f}% of steps)",
+                     loc="left", fontsize=11)
+    ax_top.legend(frameon=False, fontsize=9, labelcolor=_INK_2, loc="upper right")
+    _style_axes(ax_top)
+
+    for k, norms in tracker.opt_norms.items():
+        smooth = _positive(_rolling_mean(norms, window))
+        ax_bot.plot(steps, smooth, color=_SERIES.get(k, _INK_2), linewidth=1.6, label=k)
+        last = np.flatnonzero(np.isfinite(smooth))
+        if last.size:  # direct label at the line end
+            i = last[-1]
+            ax_bot.annotate(k, xy=(steps[i], smooth[i]), xytext=(4, 0),
+                            textcoords="offset points", va="center",
+                            fontsize=9, color=_INK_2)
+    ax_bot.set_yscale("log")
+    ax_bot.set_xlabel("iteration")
+    ax_bot.set_ylabel("gradient norm")
+    ax_bot.set_title(f"Gradient norm by optimizer group (rolling mean, {window} steps)",
+                     loc="left", fontsize=11)
+    ax_bot.legend(frameon=False, fontsize=9, labelcolor=_INK_2, loc="upper right")
+    _style_axes(ax_bot)
+
+    fig.tight_layout()
+    return fig
+
+
+def plot_update_ratios(tracker: GradientTracker):
+    steps = np.asarray(tracker.detail_steps)
+    fig, ax = plt.subplots(figsize=(10, 4))
+    fig.patch.set_facecolor(_SURFACE)
+    for k, ratios in tracker.update_ratios.items():
+        ax.plot(steps, _positive(ratios), color=_SERIES.get(k, _INK_2),
+                linewidth=1.6, marker="o", markersize=4, label=k)
+    ax.set_yscale("log")
+    ax.set_xlabel("iteration")
+    ax.set_ylabel("‖ΔW‖ / ‖W‖")
+    ax.set_title("Update-to-weight ratio per optimizer step", loc="left", fontsize=11)
+    ax.legend(frameon=False, fontsize=9, labelcolor=_INK_2, loc="upper right")
+    _style_axes(ax)
+    fig.tight_layout()
+    return fig
+
+
+def plot_layer_grad_heatmap(tracker: GradientTracker):
+    from matplotlib.colors import LinearSegmentedColormap
+
+    groups = list(tracker.layer_norms)
+    steps = np.asarray(tracker.detail_steps)
+    norms = np.array([tracker.layer_norms[g] for g in groups], dtype=float)
+    log_norms = np.log10(np.where(norms > 0, norms, np.nan))
+
+    cmap = LinearSegmentedColormap.from_list("seq_blue", _SEQ_BLUE)
+    cmap.set_bad(_SURFACE)  # zero gradients (e.g. at step 1) stay blank
+
+    fig, ax = plt.subplots(figsize=(10, 0.28 * len(groups) + 1.6))
+    fig.patch.set_facecolor(_SURFACE)
+    im = ax.imshow(log_norms, aspect="auto", cmap=cmap, interpolation="nearest")
+    ax.set_yticks(range(len(groups)))
+    ax.set_yticklabels(groups, fontsize=8)
+    n_ticks = min(8, len(steps))
+    tick_idx = np.unique(np.linspace(0, len(steps) - 1, n_ticks).round().astype(int))
+    ax.set_xticks(tick_idx)
+    ax.set_xticklabels([str(steps[i]) for i in tick_idx])
+    ax.set_xlabel("iteration")
+    ax.set_title("Per-layer gradient norm before clipping (log10)", loc="left", fontsize=11)
+    for side in ax.spines.values():
+        side.set_visible(False)
+    ax.tick_params(colors=_INK_2, labelsize=8)
+    ax.xaxis.label.set_color(_INK_2)
+    ax.title.set_color(_INK)
+    cbar = fig.colorbar(im, ax=ax, pad=0.01)
+    cbar.set_label("log10 gradient norm", color=_INK_2, fontsize=9)
+    cbar.ax.tick_params(colors=_INK_2, labelsize=8)
+    cbar.outline.set_visible(False)
+    fig.tight_layout()
+    return fig
+
+
+# ==========================================
 # Main Execution Block
 # ==========================================
 
@@ -546,7 +840,22 @@ def parse_args():
         default=0.9,
         help="Velocity loss weighting multiplier",
     )
+    parser.add_argument(
+        "--grad_clip", type=float, default=1.0, help="Max total gradient norm"
+    )
     parser.add_argument("--log_freq", type=int, default=200, help="Logging frequency")
+    parser.add_argument(
+        "--grad_log_freq",
+        type=int,
+        default=100,
+        help="Steps between per-layer gradient norms and update ratios",
+    )
+    parser.add_argument(
+        "--grad_hist_freq",
+        type=int,
+        default=500,
+        help="Steps between gradient histograms in Comet (0 disables)",
+    )
     parser.add_argument(
         "--comet_project_name",
         type=str,
@@ -631,6 +940,15 @@ def main():
         torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda) for opt in optimizers
     ]
 
+    tracker = GradientTracker(
+        model,
+        {"muon": muon_params, "adamw": adamw_params},
+        experiment,
+        clip_value=args.grad_clip,
+        log_freq=args.grad_log_freq,
+        hist_freq=args.grad_hist_freq,
+    )
+
     data_dict = {
         "losses": [],
         "b_losses": [],
@@ -656,9 +974,14 @@ def main():
         )
 
         loss_total.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        tracker.before_clip(step)
+        total_norm = torch.nn.utils.clip_grad_norm_(
+            model.parameters(), args.grad_clip
+        ).item()
+        tracker.after_clip(step, total_norm)
         for opt in optimizers:
             opt.step()
+        tracker.after_step(step)
 
         # LRs used for this step, then advance the schedules
         lr_muon = schedulers[0].get_last_lr()[0]
@@ -688,6 +1011,7 @@ def main():
             print(
                 f"Iter [{step}/{args.num_iterations}] | "
                 f"LR muon/adamw: {lr_muon:.2e}/{lr_adamw:.2e} | "
+                f"Grad norm: {total_norm:.3f} | "
                 f"Total Loss: {loss_total.item():.4f} | "
                 f"Loss b: {loss_b.item():.4f} | "
                 f"Loss eta: {loss_eta.item():.4f}"
@@ -695,6 +1019,9 @@ def main():
 
     elapsed = time.time() - start_time
     print(f"Training completed in {elapsed:.2f} seconds.")
+    frac_clipped = float(np.mean(tracker.clipped))
+    experiment.log_metric("frac_steps_clipped", frac_clipped)
+    print(f"Gradient clipping fired on {100 * frac_clipped:.1f}% of steps.")
 
     # 1. Plot & Log Training Loss Curves
     fig_loss, ax_loss = plt.subplots(figsize=(8, 4))
@@ -712,7 +1039,16 @@ def main():
     experiment.log_figure(figure_name="training_loss_curves", figure=fig_loss)
     plt.close(fig_loss)
 
-    # 2. Generate and Log Sampling Comparison Images
+    # 2. Gradient diagnostics figures
+    for fig_name, fig in (
+        ("gradient_norms", plot_gradient_norms(tracker)),
+        ("update_to_weight_ratio", plot_update_ratios(tracker)),
+        ("layer_gradient_heatmap", plot_layer_grad_heatmap(tracker)),
+    ):
+        experiment.log_figure(figure_name=fig_name, figure=fig)
+        plt.close(fig)
+
+    # 3. Generate and Log Sampling Comparison Images
     num_samples = 10000
     x0_test = base(num_samples)
 

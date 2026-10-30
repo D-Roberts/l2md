@@ -69,28 +69,189 @@ class Interpolant(torch.nn.Module):
 # ==========================================
 
 
-class DualHeadVelocityScoreMLP(torch.nn.Module):
-    def __init__(self, dim: int = 2, hidden_dim: int = 128):
+class TimestepEmbedder(torch.nn.Module):
+    """Sinusoidal embedding for diffusion timesteps."""
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        frequency_embedding_size: int = 256,
+        t_scale: float = 1000.0,
+    ):
         super().__init__()
-        self.backbone = torch.nn.Sequential(
-            torch.nn.Linear(dim + 1, hidden_dim),
+        self.mlp = torch.nn.Sequential(
+            torch.nn.Linear(frequency_embedding_size, hidden_dim),
             torch.nn.SiLU(),
             torch.nn.Linear(hidden_dim, hidden_dim),
-            torch.nn.SiLU(),
-            torch.nn.Linear(hidden_dim, hidden_dim),
-            torch.nn.SiLU(),
         )
-        self.head_b = torch.nn.Linear(hidden_dim, dim)
-        self.head_eta = torch.nn.Linear(hidden_dim, dim)
+        self.frequency_embedding_size = frequency_embedding_size
+        # The sinusoidal frequencies (max_period=10000) are designed for integer
+        # timesteps in [0, 1000]; with t in [0, 1] almost every feature would be
+        # constant, so t is rescaled before embedding.
+        self.t_scale = t_scale
 
-    def forward(self, x: torch.Tensor, t: torch.Tensor):
-        if t.dim() == 1:
-            t = t.unsqueeze(-1)
-        inp = torch.cat([x, t], dim=-1)
-        features = self.backbone(inp)
+    @staticmethod
+    def timestep_embedding(
+        t: torch.Tensor, dim: int, max_period: int = 10000
+    ) -> torch.Tensor:
+        if t.dim() > 1:
+            t = t.squeeze(-1)
+        half = dim // 2
+        freqs = torch.exp(
+            -math.log(max_period)
+            * torch.arange(start=0, end=half, dtype=torch.float32, device=t.device)
+            / half
+        )
+        args = t[:, None].float() * freqs[None, :]
+        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+        if dim % 2 != 0:
+            embedding = torch.cat(
+                [embedding, torch.zeros_like(embedding[:, :1])], dim=-1
+            )
+        return embedding
 
-        b_pred = self.head_b(features)
-        eta_pred = self.head_eta(features)
+    def forward(self, t: torch.Tensor) -> torch.Tensor:
+        t_freq = self.timestep_embedding(
+            t * self.t_scale, self.frequency_embedding_size
+        )
+        return self.mlp(t_freq)
+
+
+class Attention(torch.nn.Module):
+    """Multi-head self-attention with separate Q, K, V projections.
+
+    Separate matrices (instead of nn.MultiheadAttention's fused in_proj_weight)
+    let Muon orthogonalize Q, K and V individually, each with its own shape
+    scaling.
+    """
+
+    def __init__(self, hidden_dim: int, num_heads: int):
+        super().__init__()
+        if hidden_dim % num_heads != 0:
+            raise ValueError("hidden_dim must be divisible by num_heads.")
+        self.num_heads = num_heads
+        self.q = torch.nn.Linear(hidden_dim, hidden_dim)
+        self.k = torch.nn.Linear(hidden_dim, hidden_dim)
+        self.v = torch.nn.Linear(hidden_dim, hidden_dim)
+        self.proj = torch.nn.Linear(hidden_dim, hidden_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, N, D = x.shape
+        head_dim = D // self.num_heads
+        q, k, v = (
+            lin(x).view(B, N, self.num_heads, head_dim).transpose(1, 2)
+            for lin in (self.q, self.k, self.v)
+        )  # each (B, heads, N, head_dim)
+        out = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+        out = out.transpose(1, 2).reshape(B, N, D)
+        return self.proj(out)
+
+
+class DiTBlock(torch.nn.Module):
+    """Diffusion Transformer block with Adaptive LayerNorm (AdaLN-Zero) modulation."""
+
+    def __init__(self, hidden_dim: int, num_heads: int = 4, mlp_ratio: float = 4.0):
+        super().__init__()
+        self.norm1 = torch.nn.LayerNorm(
+            hidden_dim, elementwise_affine=False, eps=1e-6
+        )
+        self.attn = Attention(hidden_dim, num_heads=num_heads)
+        self.norm2 = torch.nn.LayerNorm(
+            hidden_dim, elementwise_affine=False, eps=1e-6
+        )
+
+        mlp_hidden_dim = int(hidden_dim * mlp_ratio)
+        self.mlp = torch.nn.Sequential(
+            torch.nn.Linear(hidden_dim, mlp_hidden_dim),
+            torch.nn.SiLU(),
+            torch.nn.Linear(mlp_hidden_dim, hidden_dim),
+        )
+
+        # AdaLN-Zero produces 6 modulation values: (scale, shift, gate) x 2
+        self.adaLN_modulation = torch.nn.Sequential(
+            torch.nn.SiLU(),
+            torch.nn.Linear(hidden_dim, 6 * hidden_dim, bias=True),
+        )
+        # Zero-initialize the modulation projection so the block starts as identity
+        torch.nn.init.constant_(self.adaLN_modulation[1].weight, 0)
+        torch.nn.init.constant_(self.adaLN_modulation[1].bias, 0)
+
+    def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+            self.adaLN_modulation(c).chunk(6, dim=-1)
+        )
+
+        # Multi-Head Attention Branch
+        norm_x = self.norm1(x) * (1 + scale_msa) + shift_msa
+        attn_out = self.attn(norm_x)
+        x = x + gate_msa * attn_out
+
+        # Feed-Forward MLP Branch
+        norm_x2 = self.norm2(x) * (1 + scale_mlp) + shift_mlp
+        mlp_out = self.mlp(norm_x2)
+        x = x + gate_mlp * mlp_out
+
+        return x
+
+
+class DualHeadVelocityScoreDiT(torch.nn.Module):
+    """Dual-Head Diffusion Transformer replacing the MLP backbone.
+
+    Each coordinate of x is one token (sequence length = dim), so attention
+    mixes information across coordinates. With a single token, softmax over
+    one key is identically 1 and attention reduces to a linear map.
+    """
+
+    def __init__(
+        self,
+        dim: int = 2,
+        hidden_dim: int = 128,
+        depth: int = 4,
+        num_heads: int = 4,
+    ):
+        super().__init__()
+        self.dim = dim
+        # Shared scalar-to-vector embedding for each coordinate value, plus a
+        # learned position embedding so the tokens know which coordinate they
+        # are. The position embedding starts at the same scale as the value
+        # embedding so the tokens are distinguishable from the first step.
+        self.x_embedder = torch.nn.Linear(1, hidden_dim)
+        self.pos_embed = torch.nn.Parameter(torch.randn(1, dim, hidden_dim))
+        self.t_embedder = TimestepEmbedder(hidden_dim)
+
+        self.blocks = torch.nn.ModuleList(
+            [DiTBlock(hidden_dim, num_heads=num_heads) for _ in range(depth)]
+        )
+
+        self.final_norm = torch.nn.LayerNorm(
+            hidden_dim, elementwise_affine=False, eps=1e-6
+        )
+        self.final_adaLN = torch.nn.Sequential(
+            torch.nn.SiLU(),
+            torch.nn.Linear(hidden_dim, 2 * hidden_dim, bias=True),
+        )
+        torch.nn.init.constant_(self.final_adaLN[1].weight, 0)
+        torch.nn.init.constant_(self.final_adaLN[1].bias, 0)
+
+        # Per-token heads: each coordinate token predicts its own component
+        self.head_b = torch.nn.Linear(hidden_dim, 1)
+        self.head_eta = torch.nn.Linear(hidden_dim, 1)
+
+    def forward(
+        self, x: torch.Tensor, t: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # x: (B, dim), t: (B,) or (B, 1)
+        c = self.t_embedder(t).unsqueeze(1)  # (B, 1, hidden_dim)
+        h = self.x_embedder(x.unsqueeze(-1)) + self.pos_embed  # (B, dim, hidden_dim)
+
+        for block in self.blocks:
+            h = block(h, c)
+
+        shift, scale = self.final_adaLN(c).chunk(2, dim=-1)
+        h = self.final_norm(h) * (1 + scale) + shift
+
+        b_pred = self.head_b(h).squeeze(-1)  # (B, dim)
+        eta_pred = self.head_eta(h).squeeze(-1)  # (B, dim)
         return b_pred, eta_pred
 
 
@@ -198,13 +359,28 @@ def parse_args():
         "--lr",
         type=float,
         default=2e-3,
-        help="Initial (peak) learning rate for the cosine schedule",
+        help="Peak AdamW learning rate (input layer, output heads, biases)",
+    )
+    parser.add_argument(
+        "--muon_lr",
+        type=float,
+        default=0.02,
+        help="Peak Muon learning rate (hidden weight matrices)",
+    )
+    parser.add_argument(
+        "--muon_momentum", type=float, default=0.95, help="Muon momentum"
+    )
+    parser.add_argument(
+        "--weight_decay",
+        type=float,
+        default=0.0,
+        help="Decoupled weight decay for both Muon and AdamW",
     )
     parser.add_argument(
         "--min_lr",
         type=float,
         default=1e-5,
-        help="Final learning rate reached at the end of the cosine schedule",
+        help="Final AdamW learning rate; the Muon lr decays by the same ratio",
     )
     parser.add_argument(
         "--warmup_steps",
@@ -216,7 +392,19 @@ def parse_args():
         "--hidden_dim",
         type=int,
         default=256,
-        help="Hidden dimension of MLP backbone",
+        help="Hidden dimension of DiT backbone",
+    )
+    parser.add_argument(
+        "--depth",
+        type=int,
+        default=4,
+        help="Number of DiT blocks",
+    )
+    parser.add_argument(
+        "--num_heads",
+        type=int,
+        default=4,
+        help="Number of attention heads in DiT",
     )
     parser.add_argument(
         "--lambda_b",
@@ -261,10 +449,39 @@ def main():
 
     # Initialize Model, Optimizer, Scheduler, Loss Weight, and Interpolant
     interpolant = Interpolant(path="one-sided-linear", gamma_type="zero").to(device)
-    model = DualHeadVelocityScoreMLP(dim=ndim, hidden_dim=args.hidden_dim).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    model = DualHeadVelocityScoreDiT(
+        dim=ndim,
+        hidden_dim=args.hidden_dim,
+        depth=args.depth,
+        num_heads=args.num_heads,
+    ).to(device)
 
-    # Linear warmup to args.lr, then cosine decay to args.min_lr
+    # Muon for the 2D weight matrices inside the DiT blocks (Q, K, V, attention
+    # output projection, MLP); AdamW for embeddings, position embedding, AdaLN
+    # projections, output heads and all biases.
+    if not hasattr(torch.optim, "Muon"):
+        raise RuntimeError("torch.optim.Muon requires PyTorch >= 2.9.")
+
+    muon_params = [
+        m.weight
+        for block in model.blocks
+        for m in (*block.attn.modules(), *block.mlp.modules())
+        if isinstance(m, torch.nn.Linear)
+    ]
+    muon_ids = {id(p) for p in muon_params}
+    adamw_params = [p for p in model.parameters() if id(p) not in muon_ids]
+
+    optimizers = [
+        torch.optim.Muon(
+            muon_params,
+            lr=args.muon_lr,
+            momentum=args.muon_momentum,
+            weight_decay=args.weight_decay,
+        ),
+        torch.optim.AdamW(adamw_params, lr=args.lr, weight_decay=args.weight_decay),
+    ]
+
+    # Linear warmup to peak lr, then cosine decay
     if not 0 <= args.warmup_steps < args.num_iterations:
         raise ValueError("--warmup_steps must be in [0, num_iterations).")
     min_ratio = args.min_lr / args.lr
@@ -277,16 +494,25 @@ def main():
         cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
         return min_ratio + (1.0 - min_ratio) * cosine
 
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    schedulers = [
+        torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda) for opt in optimizers
+    ]
 
-    data_dict = {"losses": [], "b_losses": [], "eta_losses": [], "lrs": []}
+    data_dict = {
+        "losses": [],
+        "b_losses": [],
+        "eta_losses": [],
+        "lrs_muon": [],
+        "lrs_adamw": [],
+    }
 
     print("Starting Training Loop...")
     start_time = time.time()
 
     for step in range(1, args.num_iterations + 1):
         model.train()
-        optimizer.zero_grad()
+        for opt in optimizers:
+            opt.zero_grad()
 
         x0s = base(args.batch_size)
         x1s = target(args.batch_size, device=device)
@@ -298,16 +524,20 @@ def main():
 
         loss_total.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
+        for opt in optimizers:
+            opt.step()
 
-        # LR used for this step, then advance the schedule
-        current_lr = scheduler.get_last_lr()[0]
-        scheduler.step()
+        # LRs used for this step, then advance the schedules
+        lr_muon = schedulers[0].get_last_lr()[0]
+        lr_adamw = schedulers[1].get_last_lr()[0]
+        for sched in schedulers:
+            sched.step()
 
         data_dict["losses"].append(loss_total.item())
         data_dict["b_losses"].append(loss_b.item())
         data_dict["eta_losses"].append(loss_eta.item())
-        data_dict["lrs"].append(current_lr)
+        data_dict["lrs_muon"].append(lr_muon)
+        data_dict["lrs_adamw"].append(lr_adamw)
 
         # Log metrics to CometML
         experiment.log_metrics(
@@ -315,7 +545,8 @@ def main():
                 "loss_total": loss_total.item(),
                 "loss_b": loss_b.item(),
                 "loss_eta": loss_eta.item(),
-                "lr": current_lr,
+                "lr_muon": lr_muon,
+                "lr_adamw": lr_adamw,
             },
             step=step,
         )
@@ -323,7 +554,7 @@ def main():
         if step % args.log_freq == 0 or step == 1:
             print(
                 f"Iter [{step}/{args.num_iterations}] | "
-                f"LR: {current_lr:.2e} | "
+                f"LR muon/adamw: {lr_muon:.2e}/{lr_adamw:.2e} | "
                 f"Total Loss: {loss_total.item():.4f} | "
                 f"Loss b: {loss_b.item():.4f} | "
                 f"Loss eta: {loss_eta.item():.4f}"

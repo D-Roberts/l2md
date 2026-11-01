@@ -65,7 +65,7 @@ class Interpolant(torch.nn.Module):
 
 
 # ==========================================
-# Network Architecture & Distributions
+# Network Architecture (Diffusion Mamba / DiM)
 # ==========================================
 
 
@@ -117,48 +117,118 @@ class TimestepEmbedder(torch.nn.Module):
         return self.mlp(t_freq)
 
 
-class Attention(torch.nn.Module):
-    """Multi-head self-attention with separate Q, K, V projections.
+class SelectiveScan(torch.nn.Module):
+    """One direction of a Mamba selective scan, with its own dt, B, C, A and D.
 
-    Separate matrices (instead of nn.MultiheadAttention's fused in_proj_weight)
-    let Muon orthogonalize Q, K and V individually, each with its own shape
-    scaling.
+    Discretized state-space recurrence per channel (zero-order hold on A):
+        h_t = exp(dt_t * A) * h_{t-1} + dt_t * B_t * u_t,   y_t = C_t . h_t + D * u_t
+    where dt_t, B_t, C_t depend on the input u_t (the "selective" part).
     """
 
-    def __init__(self, hidden_dim: int, num_heads: int):
+    def __init__(
+        self,
+        d_inner: int,
+        d_state: int,
+        dt_rank: int,
+        dt_min: float = 1e-3,
+        dt_max: float = 0.1,
+        dt_init_floor: float = 1e-4,
+    ):
         super().__init__()
-        if hidden_dim % num_heads != 0:
-            raise ValueError("hidden_dim must be divisible by num_heads.")
-        self.num_heads = num_heads
-        self.q = torch.nn.Linear(hidden_dim, hidden_dim)
-        self.k = torch.nn.Linear(hidden_dim, hidden_dim)
-        self.v = torch.nn.Linear(hidden_dim, hidden_dim)
-        self.proj = torch.nn.Linear(hidden_dim, hidden_dim)
+        self.d_state = d_state
+        self.dt_rank = dt_rank
+
+        # Input-dependent dt (low rank), B and C
+        self.x_proj = torch.nn.Linear(d_inner, dt_rank + 2 * d_state, bias=False)
+        self.dt_proj = torch.nn.Linear(dt_rank, d_inner, bias=True)
+
+        # Mamba dt init: small weights, and a bias chosen so that softplus(bias)
+        # is log-uniform in [dt_min, dt_max]. Large dt would make exp(dt * A)
+        # ~ 0 for most state dims, so the state would forget earlier tokens.
+        dt_init_std = dt_rank**-0.5
+        torch.nn.init.uniform_(self.dt_proj.weight, -dt_init_std, dt_init_std)
+        dt = torch.exp(
+            torch.rand(d_inner) * (math.log(dt_max) - math.log(dt_min))
+            + math.log(dt_min)
+        ).clamp(min=dt_init_floor)
+        with torch.no_grad():
+            self.dt_proj.bias.copy_(dt + torch.log(-torch.expm1(-dt)))  # softplus^-1
+
+        # S4D-real init A = -[1, ..., d_state] per channel (stored as log), D = 1
+        A = torch.arange(1, d_state + 1, dtype=torch.float32).repeat(d_inner, 1)
+        self.A_log = torch.nn.Parameter(torch.log(A))
+        self.D = torch.nn.Parameter(torch.ones(d_inner))
+
+    def forward(self, u: torch.Tensor) -> torch.Tensor:
+        # u: (B, L, d_inner)
+        batch, L, d_inner = u.shape
+        A = -torch.exp(self.A_log)  # (d_inner, d_state)
+
+        dt_raw, B_ssm, C_ssm = torch.split(
+            self.x_proj(u), [self.dt_rank, self.d_state, self.d_state], dim=-1
+        )
+        dt = torch.nn.functional.softplus(self.dt_proj(dt_raw))  # (B, L, d_inner)
+
+        state = u.new_zeros(batch, d_inner, self.d_state)
+        ys = []
+        for t in range(L):  # sequence length = number of coordinates (2 here)
+            dt_t = dt[:, t].unsqueeze(-1)  # (B, d_inner, 1)
+            dA = torch.exp(dt_t * A)  # (B, d_inner, d_state)
+            dBu = dt_t * B_ssm[:, t].unsqueeze(1) * u[:, t].unsqueeze(-1)
+            state = dA * state + dBu  # (B, d_inner, d_state)
+            ys.append((state * C_ssm[:, t].unsqueeze(1)).sum(dim=-1))  # (B, d_inner)
+
+        y = torch.stack(ys, dim=1)  # (B, L, d_inner)
+        return y + u * self.D
+
+
+class BidirectionalMamba(torch.nn.Module):
+    """Bidirectional Mamba mixer: shared projections and conv, one selective
+    scan per direction (as in Vision Mamba / DiM)."""
+
+    def __init__(self, d_model: int, d_state: int = 16, expand: int = 2):
+        super().__init__()
+        d_inner = expand * d_model
+        dt_rank = math.ceil(d_model / 16)
+
+        # Separate x-branch and gate projections (instead of one fused in_proj)
+        # so Muon orthogonalizes each matrix on its own.
+        self.in_proj_x = torch.nn.Linear(d_model, d_inner, bias=False)
+        self.in_proj_z = torch.nn.Linear(d_model, d_inner, bias=False)
+        # Non-causal depthwise conv over the token axis (kernel 3, same length)
+        self.conv1d = torch.nn.Conv1d(
+            d_inner, d_inner, kernel_size=3, padding=1, groups=d_inner
+        )
+        self.scan_fwd = SelectiveScan(d_inner, d_state, dt_rank)
+        self.scan_bwd = SelectiveScan(d_inner, d_state, dt_rank)
+        self.out_proj = torch.nn.Linear(d_inner, d_model, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, N, D = x.shape
-        head_dim = D // self.num_heads
-        q, k, v = (
-            lin(x).view(B, N, self.num_heads, head_dim).transpose(1, 2)
-            for lin in (self.q, self.k, self.v)
-        )  # each (B, heads, N, head_dim)
-        out = torch.nn.functional.scaled_dot_product_attention(q, k, v)
-        out = out.transpose(1, 2).reshape(B, N, D)
-        return self.proj(out)
+        # x: (B, L, d_model)
+        u = self.conv1d(self.in_proj_x(x).transpose(1, 2)).transpose(1, 2)
+        u = torch.nn.functional.silu(u)
+
+        y_fwd = self.scan_fwd(u)
+        y_bwd = self.scan_bwd(u.flip(1)).flip(1)
+
+        y = 0.5 * (y_fwd + y_bwd) * torch.nn.functional.silu(self.in_proj_z(x))
+        return self.out_proj(y)
 
 
-class DiTBlock(torch.nn.Module):
-    """Diffusion Transformer block with Adaptive LayerNorm (AdaLN-Zero) modulation."""
+class DiMBlock(torch.nn.Module):
+    """Diffusion Mamba (DiM) block with Adaptive LayerNorm (AdaLN-Zero)."""
 
-    def __init__(self, hidden_dim: int, num_heads: int = 4, mlp_ratio: float = 4.0):
+    def __init__(
+        self,
+        hidden_dim: int,
+        d_state: int = 16,
+        expand: int = 2,
+        mlp_ratio: float = 4.0,
+    ):
         super().__init__()
-        self.norm1 = torch.nn.LayerNorm(
-            hidden_dim, elementwise_affine=False, eps=1e-6
-        )
-        self.attn = Attention(hidden_dim, num_heads=num_heads)
-        self.norm2 = torch.nn.LayerNorm(
-            hidden_dim, elementwise_affine=False, eps=1e-6
-        )
+        self.norm1 = torch.nn.LayerNorm(hidden_dim, elementwise_affine=False, eps=1e-6)
+        self.mamba = BidirectionalMamba(hidden_dim, d_state=d_state, expand=expand)
+        self.norm2 = torch.nn.LayerNorm(hidden_dim, elementwise_affine=False, eps=1e-6)
 
         mlp_hidden_dim = int(hidden_dim * mlp_ratio)
         self.mlp = torch.nn.Sequential(
@@ -177,29 +247,28 @@ class DiTBlock(torch.nn.Module):
         torch.nn.init.constant_(self.adaLN_modulation[1].bias, 0)
 
     def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+        shift_ssm, scale_ssm, gate_ssm, shift_mlp, scale_mlp, gate_mlp = (
             self.adaLN_modulation(c).chunk(6, dim=-1)
         )
 
-        # Multi-Head Attention Branch
-        norm_x = self.norm1(x) * (1 + scale_msa) + shift_msa
-        attn_out = self.attn(norm_x)
-        x = x + gate_msa * attn_out
+        # Mamba SSM branch
+        norm_x = self.norm1(x) * (1 + scale_ssm) + shift_ssm
+        x = x + gate_ssm * self.mamba(norm_x)
 
-        # Feed-Forward MLP Branch
+        # Feed-forward MLP branch
         norm_x2 = self.norm2(x) * (1 + scale_mlp) + shift_mlp
-        mlp_out = self.mlp(norm_x2)
-        x = x + gate_mlp * mlp_out
+        x = x + gate_mlp * self.mlp(norm_x2)
 
         return x
 
 
-class DualHeadVelocityScoreDiT(torch.nn.Module):
-    """Dual-Head Diffusion Transformer replacing the MLP backbone.
+class DualHeadVelocityScoreDiM(torch.nn.Module):
+    """Dual-Head Diffusion Mamba backbone.
 
-    Each coordinate of x is one token (sequence length = dim), so attention
-    mixes information across coordinates. With a single token, softmax over
-    one key is identically 1 and attention reduces to a linear map.
+    Each coordinate of x is one token (sequence length = dim), so the
+    bidirectional scan carries information between coordinates. With a single
+    token the scan starts from a zero state, A never matters, and the forward
+    and backward scans are identical.
     """
 
     def __init__(
@@ -207,20 +276,20 @@ class DualHeadVelocityScoreDiT(torch.nn.Module):
         dim: int = 2,
         hidden_dim: int = 128,
         depth: int = 4,
-        num_heads: int = 4,
+        d_state: int = 16,
+        expand: int = 2,
     ):
         super().__init__()
         self.dim = dim
         # Shared scalar-to-vector embedding for each coordinate value, plus a
-        # learned position embedding so the tokens know which coordinate they
-        # are. The position embedding starts at the same scale as the value
-        # embedding so the tokens are distinguishable from the first step.
+        # learned position embedding at the same scale so tokens know which
+        # coordinate they are from the first step.
         self.x_embedder = torch.nn.Linear(1, hidden_dim)
         self.pos_embed = torch.nn.Parameter(torch.randn(1, dim, hidden_dim))
         self.t_embedder = TimestepEmbedder(hidden_dim)
 
         self.blocks = torch.nn.ModuleList(
-            [DiTBlock(hidden_dim, num_heads=num_heads) for _ in range(depth)]
+            [DiMBlock(hidden_dim, d_state=d_state, expand=expand) for _ in range(depth)]
         )
 
         self.final_norm = torch.nn.LayerNorm(
@@ -468,15 +537,15 @@ def grad_group_name(name: str) -> str:
     parts = name.split(".")
     if parts[0] == "blocks":
         block, sub = parts[1], parts[2]
-        if sub == "attn":
-            # Q and K together: their gradients show whether attention is
-            # actually mixing tokens (they are exactly zero with a single token)
+        if sub == "mamba":
             label = {
-                "q": "attn_qk",
-                "k": "attn_qk",
-                "v": "attn_v",
-                "proj": "attn_out",
-            }.get(parts[3], f"attn_{parts[3]}")
+                "in_proj_x": "ssm_in",
+                "in_proj_z": "ssm_in",
+                "conv1d": "ssm_conv",
+                "scan_fwd": "ssm_scan",
+                "scan_bwd": "ssm_scan",
+                "out_proj": "ssm_out",
+            }.get(parts[3], f"ssm_{parts[3]}")
         else:
             label = {"mlp": "mlp", "adaLN_modulation": "adaLN"}.get(sub, sub)
         return f"block{block}/{label}"
@@ -621,7 +690,15 @@ class GradientTracker:
 _INK, _INK_2, _MUTED = "#0b0b0b", "#52514e", "#898781"
 _GRID, _AXIS, _SURFACE = "#e1e0d9", "#c3c2b7", "#fcfcfb"
 _SERIES = {"total": "#2a78d6", "muon": "#2a78d6", "adamw": "#eb6834"}
-_SEQ_BLUE = ["#cde2fb", "#9ec5f4", "#6da7ec", "#3987e5", "#256abf", "#184f95", "#0d366b"]
+_SEQ_BLUE = [
+    "#cde2fb",
+    "#9ec5f4",
+    "#6da7ec",
+    "#3987e5",
+    "#256abf",
+    "#184f95",
+    "#0d366b",
+]
 
 
 def _style_axes(ax):
@@ -663,19 +740,40 @@ def plot_gradient_norms(tracker: GradientTracker):
     fig, (ax_top, ax_bot) = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
     fig.patch.set_facecolor(_SURFACE)
 
-    ax_top.plot(steps, _positive(tracker.total_norms), color=_SERIES["total"],
-                alpha=0.25, linewidth=0.8, label="per step")
-    ax_top.plot(steps, _positive(_rolling_mean(tracker.total_norms, window)),
-                color=_SERIES["total"], linewidth=1.6, label=f"rolling mean ({window} steps)")
+    ax_top.plot(
+        steps,
+        _positive(tracker.total_norms),
+        color=_SERIES["total"],
+        alpha=0.25,
+        linewidth=0.8,
+        label="per step",
+    )
+    ax_top.plot(
+        steps,
+        _positive(_rolling_mean(tracker.total_norms, window)),
+        color=_SERIES["total"],
+        linewidth=1.6,
+        label=f"rolling mean ({window} steps)",
+    )
     ax_top.axhline(tracker.clip_value, color=_MUTED, linewidth=1.0, linestyle="--")
-    ax_top.annotate(f"clip threshold ({tracker.clip_value:g})",
-                    xy=(1.0, tracker.clip_value), xycoords=("axes fraction", "data"),
-                    xytext=(-4, 4), textcoords="offset points",
-                    ha="right", va="bottom", fontsize=9, color=_INK_2)
+    ax_top.annotate(
+        f"clip threshold ({tracker.clip_value:g})",
+        xy=(1.0, tracker.clip_value),
+        xycoords=("axes fraction", "data"),
+        xytext=(-4, 4),
+        textcoords="offset points",
+        ha="right",
+        va="bottom",
+        fontsize=9,
+        color=_INK_2,
+    )
     ax_top.set_yscale("log")
     ax_top.set_ylabel("gradient norm")
-    ax_top.set_title(f"Total gradient norm before clipping (clipped on {frac:.1f}% of steps)",
-                     loc="left", fontsize=11)
+    ax_top.set_title(
+        f"Total gradient norm before clipping (clipped on {frac:.1f}% of steps)",
+        loc="left",
+        fontsize=11,
+    )
     ax_top.legend(frameon=False, fontsize=9, labelcolor=_INK_2, loc="upper right")
     _style_axes(ax_top)
 
@@ -685,14 +783,23 @@ def plot_gradient_norms(tracker: GradientTracker):
         last = np.flatnonzero(np.isfinite(smooth))
         if last.size:  # direct label at the line end
             i = last[-1]
-            ax_bot.annotate(k, xy=(steps[i], smooth[i]), xytext=(4, 0),
-                            textcoords="offset points", va="center",
-                            fontsize=9, color=_INK_2)
+            ax_bot.annotate(
+                k,
+                xy=(steps[i], smooth[i]),
+                xytext=(4, 0),
+                textcoords="offset points",
+                va="center",
+                fontsize=9,
+                color=_INK_2,
+            )
     ax_bot.set_yscale("log")
     ax_bot.set_xlabel("iteration")
     ax_bot.set_ylabel("gradient norm")
-    ax_bot.set_title(f"Gradient norm by optimizer group (rolling mean, {window} steps)",
-                     loc="left", fontsize=11)
+    ax_bot.set_title(
+        f"Gradient norm by optimizer group (rolling mean, {window} steps)",
+        loc="left",
+        fontsize=11,
+    )
     ax_bot.legend(frameon=False, fontsize=9, labelcolor=_INK_2, loc="upper right")
     _style_axes(ax_bot)
 
@@ -705,8 +812,15 @@ def plot_update_ratios(tracker: GradientTracker):
     fig, ax = plt.subplots(figsize=(10, 4))
     fig.patch.set_facecolor(_SURFACE)
     for k, ratios in tracker.update_ratios.items():
-        ax.plot(steps, _positive(ratios), color=_SERIES.get(k, _INK_2),
-                linewidth=1.6, marker="o", markersize=4, label=k)
+        ax.plot(
+            steps,
+            _positive(ratios),
+            color=_SERIES.get(k, _INK_2),
+            linewidth=1.6,
+            marker="o",
+            markersize=4,
+            label=k,
+        )
     ax.set_yscale("log")
     ax.set_xlabel("iteration")
     ax.set_ylabel("‖ΔW‖ / ‖W‖")
@@ -738,7 +852,9 @@ def plot_layer_grad_heatmap(tracker: GradientTracker):
     ax.set_xticks(tick_idx)
     ax.set_xticklabels([str(steps[i]) for i in tick_idx])
     ax.set_xlabel("iteration")
-    ax.set_title("Per-layer gradient norm before clipping (log10)", loc="left", fontsize=11)
+    ax.set_title(
+        "Per-layer gradient norm before clipping (log10)", loc="left", fontsize=11
+    )
     for side in ax.spines.values():
         side.set_visible(False)
     ax.tick_params(colors=_INK_2, labelsize=8)
@@ -759,7 +875,7 @@ def plot_layer_grad_heatmap(tracker: GradientTracker):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Dual-Head Stochastic Interpolants Training"
+        description="Dual-Head Stochastic Interpolants Training with DiM"
     )
     parser.add_argument(
         "--num_iterations",
@@ -774,7 +890,7 @@ def parse_args():
         "--lr",
         type=float,
         default=2e-3,
-        help="Peak AdamW learning rate (input layer, output heads, biases)",
+        help="Peak AdamW learning rate (non-Muon parameters)",
     )
     parser.add_argument(
         "--muon_lr",
@@ -790,7 +906,7 @@ def parse_args():
         type=str,
         default="polar_express",
         choices=["polar_express", "jordan"],
-        help="Muon orthogonalization: Polar Express or the original Newton-Schulz",
+        help="Muon orthogonalization: Polar Express, or 'jordan' for standard Muon",
     )
     parser.add_argument(
         "--ns_steps",
@@ -802,7 +918,7 @@ def parse_args():
         "--weight_decay",
         type=float,
         default=0.0,
-        help="Decoupled weight decay for both Muon and AdamW",
+        help="Decoupled weight decay (not applied to A_log, D, biases, pos_embed)",
     )
     parser.add_argument(
         "--min_lr",
@@ -814,25 +930,18 @@ def parse_args():
         "--warmup_steps",
         type=int,
         default=100,
-        help="Linear warmup steps from ~0 up to --lr before cosine decay (0 disables)",
+        help="Linear warmup steps from ~0 up to the peak lr before cosine decay (0 disables)",
     )
     parser.add_argument(
         "--hidden_dim",
         type=int,
         default=256,
-        help="Hidden dimension of DiT backbone",
+        help="Hidden dimension of DiM backbone",
     )
+    parser.add_argument("--depth", type=int, default=4, help="Number of DiM blocks")
+    parser.add_argument("--d_state", type=int, default=16, help="SSM state dimension")
     parser.add_argument(
-        "--depth",
-        type=int,
-        default=4,
-        help="Number of DiT blocks",
-    )
-    parser.add_argument(
-        "--num_heads",
-        type=int,
-        default=4,
-        help="Number of attention heads in DiT",
+        "--expand", type=int, default=2, help="Mamba inner expansion factor"
     )
     parser.add_argument(
         "--lambda_b",
@@ -890,26 +999,36 @@ def main():
     ndim = 2
     base = SimpleNormal(ndim, device=device)
 
-    # Initialize Model, Optimizer, Scheduler, Loss Weight, and Interpolant
+    # Initialize Interpolant and Diffusion Mamba Model
     interpolant = Interpolant(path="one-sided-linear", gamma_type="zero").to(device)
-    model = DualHeadVelocityScoreDiT(
+    model = DualHeadVelocityScoreDiM(
         dim=ndim,
         hidden_dim=args.hidden_dim,
         depth=args.depth,
-        num_heads=args.num_heads,
+        d_state=args.d_state,
+        expand=args.expand,
     ).to(device)
 
-    # Muon for the 2D weight matrices inside the DiT blocks (Q, K, V, attention
-    # output projection, MLP); AdamW for embeddings, position embedding, AdaLN
-    # projections, output heads and all biases.
-    muon_params = [
-        m.weight
-        for block in model.blocks
-        for m in (*block.attn.modules(), *block.mlp.modules())
-        if isinstance(m, torch.nn.Linear)
-    ]
+    # Muon: only the large hidden matrices (x and gate input projections, Mamba
+    # output projection, MLP). AdamW: everything else - embeddings, position
+    # embedding, x_proj (packs dt, B and C rows with different roles), dt_proj
+    # (low-rank), conv1d, A_log, D, AdaLN projections, heads and biases.
+    muon_params = []
+    for block in model.blocks:
+        ssm = block.mamba
+        muon_params += [ssm.in_proj_x.weight, ssm.in_proj_z.weight, ssm.out_proj.weight]
+        muon_params += [m.weight for m in block.mlp if isinstance(m, torch.nn.Linear)]
     muon_ids = {id(p) for p in muon_params}
-    adamw_params = [p for p in model.parameters() if id(p) not in muon_ids]
+
+    # Mamba convention: no weight decay on A_log, D, biases or the position embedding
+    adamw_decay, adamw_no_decay = [], []
+    for name, p in model.named_parameters():
+        if id(p) in muon_ids:
+            continue
+        if p.ndim < 2 or name.endswith("A_log") or name == "pos_embed":
+            adamw_no_decay.append(p)
+        else:
+            adamw_decay.append(p)
 
     optimizers = [
         Muon(
@@ -920,8 +1039,22 @@ def main():
             ns_steps=args.ns_steps,
             ns_method=args.ns_method,
         ),
-        torch.optim.AdamW(adamw_params, lr=args.lr, weight_decay=args.weight_decay),
+        torch.optim.AdamW(
+            [
+                {"params": adamw_decay, "weight_decay": args.weight_decay},
+                {"params": adamw_no_decay, "weight_decay": 0.0},
+            ],
+            lr=args.lr,
+        ),
     ]
+
+    n_total = sum(p.numel() for p in model.parameters())
+    n_muon = sum(p.numel() for p in muon_params)
+    print(
+        f"Parameters: {n_total:,} total | Muon {n_muon:,} | AdamW {n_total - n_muon:,}"
+    )
+    experiment.log_other("n_params_total", n_total)
+    experiment.log_other("n_params_muon", n_muon)
 
     # Linear warmup to peak lr, then cosine decay
     if not 0 <= args.warmup_steps < args.num_iterations:
@@ -942,7 +1075,7 @@ def main():
 
     tracker = GradientTracker(
         model,
-        {"muon": muon_params, "adamw": adamw_params},
+        {"muon": muon_params, "adamw": adamw_decay + adamw_no_decay},
         experiment,
         clip_value=args.grad_clip,
         log_freq=args.grad_log_freq,

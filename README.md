@@ -2,6 +2,8 @@
 generative modeling research
 
 ## repo structure
+
+```
 .
 ├── LICENSE
 ├── notebooks
@@ -20,3 +22,4 @@ generative modeling research
         └── multitask_discrete_uniform_flow_match.py
 
 5 directories, 11 files
+```
